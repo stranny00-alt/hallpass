@@ -2528,7 +2528,8 @@ var qrcode = function() {
    Kiosk <-> teacher sync: BroadcastChannel (same computer) +
    WebRTC via PeerJS (two devices). No server stores anything.
    ============================================================ */
-const LS = 'hallpass.v1';
+const NS = (new URLSearchParams(location.search).get('ns') || '').replace(/\W/g, '');
+const LS = 'hallpass.v1' + (NS ? '.' + NS : '');
 const DAY = 864e5, MIN = 6e4;
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -2747,7 +2748,7 @@ function setConfig(mut, opts = {}) {
 }
 function mergeIn(msg) {
   let changed = false; const fwd = [];
-  if (msg.config && msg.config.v > C().v) { S.config = Object.assign(defaults().config, msg.config); changed = true; applyTheme(); }
+  if (msg.config && msg.config.v > C().v) { const keepLogo = C().theme.logo; S.config = Object.assign(defaults().config, msg.config); if (S.config.theme?.logo === '__keep') S.config.theme = { ...S.config.theme, logo: keepLogo }; changed = true; applyTheme(); }
   for (const p of msg.passes ? (Array.isArray(msg.passes) ? msg.passes : Object.values(msg.passes)) : []) {
     const cur = S.passes[p.id];
     if (!cur || p.u > cur.u) { S.passes[p.id] = p; fwd.push(p); changed = true; }
@@ -2771,7 +2772,7 @@ const Sync = {
   bc: null, peer: null, conns: new Set(), lastSeen: 0, state: 'off', retry: null, tries: 0,
   init() {
     if ('BroadcastChannel' in window) {
-      this.bc = new BroadcastChannel('hallpass-sync');
+      this.bc = new BroadcastChannel('hallpass-sync' + NS);
       this.bc.onmessage = e => this.receive(e.data, 'bc');
       this.bc.postMessage({ t: 'hello', ...snapshot() });
     }
@@ -2781,6 +2782,7 @@ const Sync = {
   myPeerId(role) { return `hallpass-${S.pairCode}-${role === 'teacher' ? 't' : 'k'}`; },
   startPeer() {
     this.stopPeer();
+    Relay.start();
     // Only the device's own role (not a ?view override tab) holds the peer id.
     if (!S.pairCode || !window.Peer || !S.role || VIEW !== S.role) return this.updateState();
     this.state = 'connecting'; this.updateState();
@@ -2810,14 +2812,20 @@ const Sync = {
   },
   connected() { return [...this.conns].some(c => c.open) && Date.now() - this.lastSeen < 25000; },
   sendPeer(m) { for (const c of this.conns) if (c.open) try { c.send(m); } catch { } },
-  send(m, except) { if (except !== 'bc') this.bc?.postMessage(m); if (except !== 'peer') this.sendPeer(m); },
+  send(m, except) {
+    if (except !== 'bc') this.bc?.postMessage(m);
+    if (except !== 'peer') this.sendPeer(m);
+    // backup route only when the direct link is down
+    if (except !== 'relay' && !this.connected() && m.t !== 'ping' && m.t !== 'hello' && m.t !== 'full') Relay.send(m);
+  },
   receive(m, src) {
     if (!m || typeof m !== 'object') return;
     if (m.t === 'ping') return;
+    if (m.t === 'hello' && src === 'relay') { mergeIn(m); Relay.reply(m); return; }
     if (m.t === 'unpair' && src === 'peer') return;
     const r = mergeIn(m);
     if (m.t === 'hello' && src === 'bc') this.bc.postMessage({ t: 'full', ...snapshot() });
-    if (m.t === 'full' && src === 'peer') this.sendPeer({ t: 'full', ...snapshot(), ack: true }); // make sure both sides converge
+    if (m.t === 'full' && src === 'peer' && !m.ack) this.sendPeer({ t: 'full', ...snapshot(), ack: true }); // reply once so both sides converge
     // relay what was new to the other transport (teacher tab <-> kiosk tablet via another tab)
     if (r.fwd.length) this.send({ t: 'passes', passes: r.fwd }, src);
     if (m.config && m.config.v === C().v && r.changed) this.send({ t: 'config', config: C() }, src);
@@ -2828,16 +2836,99 @@ const Sync = {
     else if (VIEW !== S.role) s = 'tab';
     else if (!window.Peer) s = 'nolib';
     else if (this.connected()) s = 'ok';
+    else if (Relay.heard) s = 'relay';
     else if (this.state === 'shared') s = 'shared';
-    else if (this.peer && this.peer.open) s = 'waiting';
+    else if ((this.peer && this.peer.open) || Relay.up) s = 'waiting';
     else s = 'connecting';
     if (s !== this.last) { this.last = s; $$('[data-sync]').forEach(el => el.innerHTML = syncBadge()); }
+  },
+};
+/* ---------- backup route: encrypted relay through ntfy.sh ----------
+   Used only when the direct (WebRTC) link can't be made, e.g. school Wi-Fi that
+   isolates devices. Everything is encrypted in the browser with a key made from
+   the pair code (AES-GCM), so the relay only ever sees scrambled text. */
+const Relay = {
+  base: (new URLSearchParams(location.search).get('relay') || 'https://ntfy.sh').replace(/\/$/, ''),
+  es: null, key: null, topic: null, up: false, heard: 0, parts: new Map(), gen: 0, pending: [], greeted: new Set(),
+  async start() {
+    this.stop(); const gen = ++this.gen;
+    if (!S.pairCode || !S.role || VIEW !== S.role || !window.crypto?.subtle || !window.EventSource) return;
+    const enc = new TextEncoder(), code = S.pairCode;
+    const hash = await crypto.subtle.digest('SHA-256', enc.encode('hallpass-topic:' + code));
+    const topic = 'hp' + [...new Uint8Array(hash)].slice(0, 16).map(b => b.toString(16).padStart(2, '0')).join('');
+    const km = await crypto.subtle.importKey('raw', enc.encode(code), 'PBKDF2', false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt: enc.encode('hallpass-relay-v1'), iterations: 120000, hash: 'SHA-256' }, km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    if (gen !== this.gen) return;
+    this.topic = topic; this.key = key;
+    const es = this.es = new EventSource(`${this.base}/${topic}/sse`);
+    es.onopen = () => { if (gen !== this.gen) return; const first = !this.up; this.up = true; Sync.updateState(); if (first) this.hello(); this.flush(); };
+    es.onerror = () => { this.up = false; Sync.updateState(); };
+    es.addEventListener('message', ev => { try { const m = JSON.parse(ev.data); if (m.event === 'message' || !m.event) this.onRaw(m.message || ''); } catch { } });
+  },
+  stop() { this.gen++; if (this.es) try { this.es.close(); } catch { } this.es = null; this.up = false; this.heard = 0; },
+  since() {
+    const last = S.relaySync || 0, base = last ? last - 15 * MIN : 0;
+    return VIEW === 'kiosk' ? Math.max(base, Date.now() - 8 * DAY) : base; // the kiosk only needs the last week
+  },
+  hello() { this.send({ t: 'hello', role: S.role, cv: C().v, since: this.since() }); },
+  reply(m) {
+    // send only what the other side is missing
+    const since = m.since || 0;
+    const passes = Object.values(S.passes).filter(p => p.u > since && (m.role !== 'kiosk' || p.out > Date.now() - 8 * DAY));
+    const out = { t: 'full', passes };
+    if (C().v > (m.cv || 0)) out.config = C();
+    this.send(out);
+    // if we haven't introduced ourselves to this device yet, do it so we get its news too
+    if (m._from && !this.greeted.has(m._from)) { this.greeted.add(m._from); this.hello(); }
+  },
+  async pack(obj) {
+    let bytes = new TextEncoder().encode(JSON.stringify(obj));
+    if (window.CompressionStream) bytes = new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this.key, bytes));
+    const all = new Uint8Array(13 + ct.length); all[0] = window.CompressionStream ? 1 : 0; all.set(iv, 1); all.set(ct, 13);
+    let bin = ''; for (let i = 0; i < all.length; i += 8192) bin += String.fromCharCode(...all.subarray(i, i + 8192));
+    return btoa(bin);
+  },
+  async unpack(b64) {
+    const all = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    let bytes = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: all.subarray(1, 13) }, this.key, all.subarray(13)));
+    if (all[0] === 1) bytes = new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+    return JSON.parse(new TextDecoder().decode(bytes));
+  },
+  async send(m) {
+    if (!this.key) return;
+    if (!this.up) { if (this.pending.length < 200) this.pending.push(m); return; }
+    try {
+      let msg = { ...m, _from: S.deviceId };
+      // a big uploaded logo would take dozens of relay messages; the kiosk keeps the one it has
+      if (msg.config && String(msg.config.theme?.logo || '').length > 15000) msg.config = { ...msg.config, theme: { ...msg.config.theme, logo: '__keep' } };
+      const data = await this.pack(msg), id = uid(6), size = 3000, n = Math.ceil(data.length / size);
+      for (let i = 0; i < n; i++) {
+        await fetch(`${this.base}/${this.topic}`, { method: 'POST', body: `hp1|${S.deviceId}|${id}|${i}|${n}|${data.slice(i * size, (i + 1) * size)}` });
+      }
+    } catch (e) { console.warn('relay send failed', e); }
+  },
+  flush() { const q = this.pending.splice(0); q.forEach(m => this.send(m)); },
+  async onRaw(txt) {
+    const f = txt.split('|'); if (f[0] !== 'hp1' || f.length < 6) return;
+    const [, from, id, i, n] = f, chunk = f.slice(5).join('|');
+    if (from === S.deviceId) return;
+    const k = from + id; const got = this.parts.get(k) || { n: +n, c: [], t: Date.now() }; got.c[+i] = chunk; this.parts.set(k, got);
+    if (got.c.filter(x => x != null).length < got.n) return;
+    this.parts.delete(k);
+    for (const [kk, v] of this.parts) if (Date.now() - v.t > 60000) this.parts.delete(kk);
+    try {
+      const m = await this.unpack(got.c.join(''));
+      this.heard = Date.now(); S.relaySync = Date.now(); save(); Sync.updateState();
+      Sync.receive(m, 'relay');
+    } catch (e) { console.warn('relay message could not be read', e); }
   },
 };
 function syncBadge() {
   const other = VIEW === 'teacher' ? 'kiosk' : 'teacher laptop';
   const map = {
-    ok: ['ok', `Linked to ${other}`], waiting: ['warn', `Waiting for ${other}`], connecting: ['warn', 'Connecting…'],
+    ok: ['ok', `Linked to ${other}`], relay: ['ok', `Linked to ${other} (backup route)`], waiting: ['warn', `Waiting for ${other}`], connecting: ['warn', 'Connecting…'],
     shared: ['ok', 'Synced via another tab'], tab: ['ok', 'Synced with this computer'], solo: ['', 'Not paired'], nolib: ['bad', 'Sync library missing'],
   };
   const [cls, txt] = map[Sync.last || 'solo'] || map.solo;

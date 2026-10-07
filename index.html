@@ -2581,7 +2581,7 @@ let S = (() => {
   return s;
 })();
 let saveTimer = null;
-function save() { clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { localStorage.setItem(LS, JSON.stringify(S)); } catch (e) { console.warn('save failed', e); } }, 50); }
+function save() { clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { localStorage.setItem(LS, JSON.stringify(S)); } catch (e) { console.warn('save failed', e); } }, 50); window.__cloudChanged?.(); }
 
 /* ---------- view (per tab) ---------- */
 const params = new URLSearchParams(location.search);
@@ -2589,6 +2589,10 @@ let VIEW = params.get('view') || S.role; // a kiosk tab on the teacher's compute
 (function handlePairLink() {
   const m = location.hash.match(/pair=([a-z0-9]+)/i);
   if (m) { S.pairCode = m[1].toLowerCase(); S.role = 'kiosk'; VIEW = 'kiosk'; save(); history.replaceState(null, '', location.pathname + location.search); }
+  // Teacher link (#teacher=CODE): a bookmark that survives Chrome forgetting its data.
+  // Opening it reconnects to the kiosk, which sends the classes and passes back.
+  const t = location.hash.match(/teacher=([a-z0-9]+)/i);
+  if (t) { const code = t[1].toLowerCase(); if (S.role !== 'teacher' || S.pairCode !== code) { S.pairCode = code; S.role = 'teacher'; VIEW = 'teacher'; save(); } }
 })();
 
 /* ---------- data helpers ---------- */
@@ -3128,6 +3132,135 @@ function tick() {
 setInterval(tick, 1000);
 
 /* ============================================================
+   GOOGLE DRIVE SAVE (teacher laptop only)
+   Signs in with Google and keeps one file, hallpass-data.json, in the
+   app's hidden folder of the teacher's own Drive (drive.appdata scope:
+   the app can only see its own file, nothing else in Drive).
+   ============================================================ */
+const GOOGLE_CLIENT_ID = '638688717620-8gomgq70p2ka5bbagnmo4rtv3gghusn2.apps.googleusercontent.com';
+const DRIVE_FILE = 'hallpass-data.json';
+
+const Cloud = {
+  tc: null, token: null, exp: 0, busy: false, dirty: false, timer: null, lastSave: 0, err: '', ready: false, onSignedIn: null,
+  configured() { return /\.apps\.googleusercontent\.com$/.test(GOOGLE_CLIENT_ID); },
+  load() {
+    if (!this.configured() || NS || window.google?.accounts?.oauth2) return this.init();
+    const s = document.createElement('script'); s.src = 'https://accounts.google.com/gsi/client'; s.async = true;
+    s.onload = () => this.init(); s.onerror = () => { this.err = "Couldn't reach Google sign-in"; this.paint(); };
+    document.head.appendChild(s);
+  },
+  init() {
+    if (!this.configured() || !window.google?.accounts?.oauth2) return this.paint();
+    this.tc = google.accounts.oauth2.initTokenClient({
+      client_id: GOOGLE_CLIENT_ID,
+      scope: 'https://www.googleapis.com/auth/drive.appdata openid email',
+      callback: r => this.onToken(r),
+      error_callback: e => { this.busy = false; this.err = e?.type === 'popup_closed' ? '' : (e?.message || 'Sign-in was cancelled'); this.paint(); },
+    });
+    this.ready = true; this.paint();
+  },
+  signedIn() { return !!S.cloudEmail; },
+  valid() { return !!this.token && Date.now() < this.exp; },
+  signIn(silent) {
+    if (!this.tc) return toast("Google sign-in isn't available. Check your internet connection.");
+    this.err = ''; this.busy = true; this.paint();
+    this.tc.requestAccessToken({ prompt: silent && S.cloudEmail ? '' : (S.cloudEmail ? '' : 'select_account'), login_hint: S.cloudEmail || undefined });
+  },
+  async onToken(r) {
+    this.busy = false;
+    if (r.error) { this.err = r.error_description || r.error; return this.paint(); }
+    this.token = r.access_token; this.exp = Date.now() + (Number(r.expires_in || 3600) - 120) * 1000;
+    try {
+      if (!S.cloudEmail) {
+        const u = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: 'Bearer ' + this.token } }).then(x => x.json());
+        S.cloudEmail = u.email || 'Google account'; save();
+      }
+      await this.pull();
+      await this.push();
+      const cb = this.onSignedIn; this.onSignedIn = null; cb?.();
+    } catch (e) { this.err = e.message || String(e); }
+    this.paint();
+  },
+  async api(url, opts = {}) {
+    const res = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: 'Bearer ' + this.token } });
+    if (res.status === 401) { this.token = null; throw new Error('Google sign-in expired'); }
+    if (!res.ok) throw new Error(`Google Drive error ${res.status}`);
+    return res;
+  },
+  async fileId() {
+    if (S.cloudFileId) return S.cloudFileId;
+    const q = encodeURIComponent(`name='${DRIVE_FILE}' and trashed=false`);
+    const j = await this.api(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${q}&fields=files(id,modifiedTime)&orderBy=modifiedTime desc`).then(r => r.json());
+    S.cloudFileId = j.files?.[0]?.id || null; save();
+    return S.cloudFileId;
+  },
+  // Bring the Drive copy into this browser (merges; never throws away newer local changes)
+  async pull() {
+    const id = await this.fileId(); if (!id) return false;
+    let d;
+    try { d = await this.api(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`).then(r => r.json()); }
+    catch (e) { if (/404/.test(e.message)) { S.cloudFileId = null; save(); return false; } throw e; }
+    if (d?.app !== 'hallpass') return false;
+    mergeIn({ config: d.config, passes: d.passes });
+    if (!S.pairCode && d.pairCode) { S.pairCode = d.pairCode; }
+    if (!S.siteUrl && d.siteUrl) S.siteUrl = d.siteUrl;
+    if (!S.role) { S.role = 'teacher'; VIEW = VIEW || 'teacher'; }
+    save(); Sync.startPeer();
+    return true;
+  },
+  async push() {
+    if (!this.signedIn()) return;
+    if (!this.valid()) { this.dirty = true; return this.paint(); }
+    this.dirty = false; this.saving = true; this.paint();
+    const body = JSON.stringify({ app: 'hallpass', v: 1, savedAt: Date.now(), pairCode: S.pairCode, siteUrl: S.siteUrl || null, config: C(), passes: S.passes });
+    try {
+      let id = await this.fileId();
+      if (id) {
+        await this.api(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body });
+      } else {
+        const meta = { name: DRIVE_FILE, parents: ['appDataFolder'], mimeType: 'application/json' };
+        const fd = new FormData();
+        fd.append('metadata', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
+        fd.append('file', new Blob([body], { type: 'application/json' }));
+        const j = await this.api('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', { method: 'POST', body: fd }).then(r => r.json());
+        S.cloudFileId = j.id; save();
+      }
+      this.lastSave = Date.now(); this.err = '';
+    } catch (e) { this.dirty = true; this.err = e.message; }
+    this.saving = false; this.paint();
+  },
+  changed() {
+    if (VIEW !== 'teacher' || !this.signedIn()) return;
+    this.dirty = true; clearTimeout(this.timer); this.timer = setTimeout(() => this.push(), 4000); this.paint();
+  },
+  signOut() {
+    try { if (this.token) google.accounts.oauth2.revoke(this.token); } catch { }
+    this.token = null; S.cloudEmail = null; S.cloudFileId = null; save(); this.paint(); rerender();
+  },
+  chip() {
+    if (!this.configured() || VIEW !== 'teacher') return '';
+    if (!this.signedIn()) return `<button class="sync" data-cloud="in" title="Save everything to your Google Drive">☁️ Sign in to save</button>`;
+    if (this.busy) return `<span class="sync">☁️ Signing in…</span>`;
+    if (!this.valid()) return `<button class="sync" data-cloud="re" title="Google sign-ins last about an hour. Click to keep saving."><span class="dot ${this.dirty ? 'warn' : ''}"></span>☁️ ${this.dirty ? 'Click to save to Drive' : 'Drive paused, click to reconnect'}</button>`;
+    if (this.saving) return `<span class="sync"><span class="dot warn"></span>☁️ Saving…</span>`;
+    if (this.err) return `<button class="sync" data-cloud="re" title="${esc(this.err)}"><span class="dot bad"></span>☁️ Not saved, click to retry</button>`;
+    return `<span class="sync" title="Signed in as ${esc(S.cloudEmail)}"><span class="dot ok"></span>☁️ Saved to Drive${this.lastSave ? ' · ' + fmtTime(this.lastSave) : ''}</span>`;
+  },
+  paint() {
+    $$('[data-cloudchip]').forEach(el => { el.innerHTML = this.chip(); });
+    $$('[data-cloud]').forEach(b => b.onclick = () => this.signIn(b.dataset.cloud === 're'));
+  },
+};
+// Google's sign-in window can only open from a click, so after the hourly sign-in expires
+// we quietly renew on the teacher's next click if there is something waiting to be saved.
+document.addEventListener('pointerdown', e => {
+  if (VIEW === 'teacher' && Cloud.signedIn() && !Cloud.valid() && !Cloud.busy && Cloud.tc && Cloud.dirty && !e.target.closest('[data-cloud]')) Cloud.signIn(true);
+}, true);
+setInterval(() => { if (VIEW === 'teacher' && Cloud.valid() && !Cloud.dirty) Cloud.pull().catch(() => { }); Cloud.paint(); }, 10 * 60 * 1000);
+
+window.__cloudChanged = () => Cloud.changed();
+
+/* ============================================================
    ROSTER FILE IMPORT — CSV / TSV / Excel (.xlsx)
    Reads files exported from a gradebook / SIS (PowerSchool,
    Infinite Campus, JMC, Google Sheets…), guesses which columns
@@ -3359,7 +3492,13 @@ function renderSetup() {
       <button id="asT"><span class="ic">💻</span><b>This is my teacher laptop</b><span class="muted">Classes, live view, reports and settings.</span></button>
       <button id="asK"><span class="ic">📱</span><b>This is the kiosk by the door</b><span class="muted">A tablet or spare computer students tap to sign out.</span></button>
     </div>
+    ${Cloud.configured() ? `<div class="card stack" style="margin-top:20px;text-align:left">
+      <b>Already using it? Sign in to get everything back.</b>
+      <span class="small muted">Your classes, settings and passes are saved in your own Google Drive.</span>
+      <div><button class="btn primary" id="gsi">☁️ Sign in with Google</button></div>
+    </div>` : ''}
     <p class="small muted" style="margin-top:28px">Tip: set up the teacher laptop first. It gives you a QR code to link the kiosk.</p></div>`;
+  $('#gsi') && ($('#gsi').onclick = () => { Cloud.onSignedIn = () => { S.role = VIEW = 'teacher'; save(); boot(); toast(C().classes.length ? `Welcome back! Loaded ${C().classes.length} classes from Google Drive.` : 'Signed in. Your data will be saved to Google Drive.'); }; Cloud.signIn(false); });
   $('#asT').onclick = () => { S.role = VIEW = 'teacher'; save(); boot(); };
   $('#asK').onclick = () => { S.role = VIEW = 'kiosk'; save(); boot(); };
 }
@@ -3379,12 +3518,13 @@ function renderTeacher() {
       <div class="brand">${brandMark(36)}${esc(t.title)}</div>
       <nav class="tabs">${TABS.map(([k, l]) => `<button data-tab="${k}" class="${k === TAB ? 'on' : ''}">${l}</button>`).join('')}</nav>
       <div class="spacer"></div>
+      <span data-cloudchip>${Cloud.chip()}</span>
       <span class="sync" data-sync>${syncBadge()}</span>
     </div></header>
     <main class="wrap" id="view" style="padding-top:20px"></main>`;
   $$('[data-tab]').forEach(b => b.onclick = () => { TAB = b.dataset.tab; try { sessionStorage.setItem('hp.tab', TAB); } catch { } renderTeacher(); });
   ({ now: viewNow, log: viewLog, reports: viewReports, classes: viewClasses, settings: viewSettings, pair: viewPair }[TAB] || viewNow)($('#view'));
-  tick();
+  Cloud.paint(); tick();
 }
 
 function rerender(fromSync) {
@@ -3408,9 +3548,15 @@ function viewNow(el) {
   const classes = C().classes;
   if (!classes.length) {
     el.innerHTML = `<div class="card stack" style="text-align:center;padding:40px">
+      ${S.pairCode ? `<div style="font-size:2.4rem">🔄</div><h2>Getting your classes from the kiosk…</h2>
+      <p class="muted">Keep the kiosk open. If nothing shows up within a minute, the kiosk may be off or has no classes yet.</p>
+      <p class="small"><span class="sync" data-sync>${syncBadge()}</span></p>
+      <p class="muted small">Or start fresh:</p>` : ''}
       <div style="font-size:2.4rem">📋</div><h2>Add your first class</h2>
       <p class="muted">Upload the roster file from your gradebook (CSV or Excel) and you're ready.</p>
-      <div><button class="btn primary" id="goC">Add classes</button></div></div>`;
+      <div><button class="btn primary" id="goC">Add classes</button></div>
+      ${S.pairCode ? '' : '<p class="small muted">Lost your data, or setting up a new computer? <a href="#" id="goR">Reconnect to your kiosk</a> to bring everything back.</p>'}</div>`;
+    $('#goR') && ($('#goR').onclick = e => { e.preventDefault(); TAB = 'pair'; renderTeacher(); });
     $('#goC').onclick = () => { TAB = 'classes'; renderTeacher(); };
     return;
   }
@@ -3824,7 +3970,11 @@ function viewSettings(el) {
     </div>
 
     <div class="card stack"><h3>Your data</h3>
-      <p class="small muted">Everything lives in this browser (and the kiosk's). Back up now and then, especially before clearing browser data. ${Object.keys(S.passes).length} passes stored.</p>
+      ${Cloud.configured() ? `<div class="row" style="padding:10px 12px;border:1px solid var(--line);border-radius:10px">
+        ${S.cloudEmail ? `<span>☁️ Saving to the Google Drive of <b>${esc(S.cloudEmail)}</b></span><div class="spacer"></div><button class="btn sm" id="gpush">Save now</button><button class="btn sm ghost danger" id="gout">Sign out</button>`
+        : `<span>☁️ Sign in with Google to save everything to your Drive and get it back on any computer.</span><div class="spacer"></div><button class="btn sm primary" id="gin">Sign in with Google</button>`}
+      </div>` : ''}
+      <p class="small muted">Everything also lives in this browser (and the kiosk's). ${Object.keys(S.passes).length} passes stored.</p>
       <div class="row"><button class="btn" id="bk">Download backup</button><label class="btn">Restore backup<input type="file" id="rs" accept=".json" hidden></label></div>
       <div class="row"><label class="field">Delete passes before<input type="date" id="pd"></label><button class="btn danger" id="pg" style="align-self:flex-end">Delete old passes</button></div>
       <div class="row"><button class="btn danger" id="reset">Reset this device</button><span class="small muted">Wipes everything on this browser.</span></div>
@@ -3850,6 +4000,9 @@ function viewSettings(el) {
     $('#lgup').onchange = e => { const f = e.target.files[0]; if (!f) return; grab(); shrinkImage(f, 320).then(u => { c.theme.logo = u; draw(); }).catch(() => toast("Couldn't read that image")); };
     $('#antf').onchange = e => { if (e.target.checked && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission(); };
     $('#tbeep').onclick = () => { const s = C().alerts.sound; C().alerts.sound = true; beep(); C().alerts.sound = s; };
+    $('#gin') && ($('#gin').onclick = () => { Cloud.onSignedIn = () => renderTeacher(); Cloud.signIn(false); });
+    $('#gout') && ($('#gout').onclick = () => { if (confirm('Stop saving to Google Drive on this computer? Your Drive copy stays.')) Cloud.signOut(); });
+    $('#gpush') && ($('#gpush').onclick = () => Cloud.valid() ? Cloud.push().then(() => toast('Saved to Google Drive')) : Cloud.signIn(true));
     $('#bk').onclick = () => download(`hallpass-backup-${isoDate(Date.now())}.json`, JSON.stringify({ app: 'hallpass', v: 1, config: C(), passes: S.passes }, null, 1), 'application/json');
     $('#rs').onchange = async e => {
       const f = e.target.files[0]; if (!f) return;
@@ -3890,7 +4043,11 @@ function viewPair(el) {
     <div class="grid2">
       <div class="card stack">
         ${!S.pairCode ? `<p>Make a private pair code. Your laptop and the kiosk use it to find each other, then talk directly over an encrypted connection.</p>
-          <div><button class="btn primary" id="mk">Create pair code</button></div>` : `
+          <div><button class="btn primary" id="mk">Create pair code</button></div>
+          <hr style="border:0;border-top:1px solid var(--line);width:100%">
+          <h3>Already have a kiosk set up?</h3>
+          <p class="small muted">Reconnect with its pair code and your classes, settings and passes come back from the kiosk. Find the code on the kiosk under ⚙︎ → PIN.</p>
+          <div class="row"><input type="text" id="rc" placeholder="Pair code" autocapitalize="off" autocomplete="off" style="font-family:ui-monospace,monospace;letter-spacing:.08em"><button class="btn primary" id="rcgo">Reconnect</button></div>` : `
           <label class="field">Your site's web address
             <div class="row"><input type="text" id="site" value="${esc(S.siteUrl || hereUrl())}" placeholder="yourname.github.io/hallpass" style="flex:1;min-width:220px"><button class="btn sm" id="siteSave">Update QR</button></div></label>
           ${!site ? `<p class="small" style="color:var(--warn)">This page isn't open from a web address the tablet can reach (it looks like a downloaded file or a preview). Type your GitHub Pages address above to make the QR code, or use the pair code below instead.</p>` : ''}
@@ -3900,6 +4057,12 @@ function viewPair(el) {
               ${link ? `<button class="btn sm" id="cp">Copy link</button><span class="small muted" style="max-width:240px;word-break:break-all">${esc(link)}</span>` : ''}</div>
           </div>
           <div class="small muted"><b>On the tablet:</b> ${link ? 'scan the code with the camera and open the link, <i>or</i> ' : ''}open ${site ? `<b>${esc(site.replace(/^https?:\/\//, ''))}</b>` : 'your site'}, tap <b>This is the kiosk by the door</b>, then type the pair code.</div>
+          <div class="card stack" style="background:var(--panel-2);box-shadow:none;padding:14px">
+            <b>⭐ Bookmark your teacher link</b>
+            <span class="small muted">If Chrome ever forgets your data (cleared history, school settings that wipe sites when Chrome closes, a new computer), open this link and everything comes back from the kiosk in a few seconds.</span>
+            <div class="row"><code class="small" style="word-break:break-all;flex:1">${esc((site || location.origin + location.pathname) + '#teacher=' + S.pairCode)}</code><button class="btn sm" id="cpt">Copy</button></div>
+            <span class="small muted">Keep it private: anyone with this link can see your hall pass data.</span>
+          </div>
           <div class="row"><span class="sync" data-sync>${syncBadge()}</span><div class="spacer"></div><button class="btn sm danger" id="unp">Unlink &amp; make a new code</button></div>`}
       </div>
       <div class="card stack small">
@@ -3910,7 +4073,10 @@ function viewPair(el) {
         <p class="muted">If the badge stays on "Waiting" on school Wi-Fi, the network may block peer-to-peer traffic. Try the tablet on a phone hotspot to check, then ask IT to allow WebRTC.</p>
       </div>
     </div></div>`;
-  $('#mk') && ($('#mk').onclick = () => { S.pairCode = uid(10); save(); Sync.startPeer(); viewPair(el); });
+  $('#mk') && ($('#mk').onclick = () => { S.pairCode = uid(10); save(); Sync.startPeer(); boot(); });
+  $('#rcgo') && ($('#rcgo').onclick = () => { const v = $('#rc').value.trim().toLowerCase().replace(/[^a-z0-9]/g, ''); if (v.length < 6) return toast('Type the pair code shown on the kiosk'); S.pairCode = v; save(); TAB = 'now'; boot(); toast('Reconnecting to the kiosk…'); });
+  $('#rc') && ($('#rc').onkeydown = e => e.key === 'Enter' && $('#rcgo').click());
+  $('#cpt') && ($('#cpt').onclick = () => navigator.clipboard?.writeText((site || location.origin + location.pathname) + '#teacher=' + S.pairCode).then(() => toast('Teacher link copied. Bookmark it or save it somewhere safe.')));
   $('#unp') && ($('#unp').onclick = () => { if (confirm('The kiosk will stop syncing until you pair it again. Continue?')) { S.pairCode = uid(10); save(); Sync.startPeer(); viewPair(el); } });
   $('#siteSave') && ($('#siteSave').onclick = () => { const v = $('#site').value; const n = normalizeSite(v); if (v.trim() && !n) return toast("That doesn't look like a web address"); S.siteUrl = n || null; save(); viewPair(el); });
   $('#site') && ($('#site').onkeydown = e => e.key === 'Enter' && $('#siteSave').click());
@@ -3923,10 +4089,14 @@ function viewPair(el) {
    ============================================================ */
 function boot() {
   applyTheme();
+  if (!Cloud.loading) { Cloud.loading = true; Cloud.load(); }
   if (!VIEW) return renderSetup();
   autoClose();
   if (!Sync.bc && !Sync.peer) Sync.init(); else Sync.startPeer();
   if (VIEW === 'kiosk') { renderKiosk(); keepAwake(); } else renderTeacher();
+  // keep the teacher link in the address bar so any bookmark of this page can restore it
+  if (VIEW === 'teacher' && S.role === 'teacher' && S.pairCode && !NS) history.replaceState(null, '', location.pathname + location.search + '#teacher=' + S.pairCode);
+  try { navigator.storage?.persist?.(); } catch { }
 }
 boot();
 
